@@ -1,6 +1,9 @@
 #!/bin/bash
+set -euo pipefail
 
 # Script to run ProteinMPNN on a single PDB file
+
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default values
 NUM_SEQ_PER_TARGET=2
@@ -84,9 +87,9 @@ fi
 # source activate mlfold 
 
 echo "Running ProteinMPNN with the following command:"
-echo "python ../protein_mpnn_run.py ${CMD_ARGS[@]}"
+echo "python ${SCRIPT_DIR}/../protein_mpnn_run.py ${CMD_ARGS[@]}"
 
 # Execute the command
-python ../protein_mpnn_run.py "${CMD_ARGS[@]}"
+python "${SCRIPT_DIR}/../protein_mpnn_run.py" "${CMD_ARGS[@]}"
 
-echo "ProteinMPNN run finished. Check ${OUTPUT_DIR} for results." 
+echo "ProteinMPNN run finished. Check ${OUTPUT_DIR} for results."
