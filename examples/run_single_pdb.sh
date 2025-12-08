@@ -8,24 +8,27 @@ SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Default values
 NUM_SEQ_PER_TARGET=2
 SAMPLING_TEMP="0.1"
+BATCH_SIZE=1
 CHAINS_TO_DESIGN="" # Empty means all chains will be processed by default logic in protein_mpnn_run.py
 
 # Help message
 usage() {
-  echo "Usage: $0 -p <pdb_file> -o <output_dir> [-c <chains_to_design>] [-n <num_seq_per_target>] [-t <sampling_temp>]"
+  echo "Usage: $0 -p <pdb_file>[,pdb2,pdb3...] -o <output_dir> [-c <chains_to_design>] [-n <num_seq_per_target>] [-t <sampling_temp>]"
   echo ""
   echo "Options:"
-  echo "  -p <pdb_file>             : Path to the input PDB file (required)."
+  echo "  -p <pdb_file>[,pdb2...]   : Path to one PDB file (required)."
+  echo "                              Comma-separated list allowed to process distinct inputs sequentially."
   echo "  -o <output_dir>           : Path to the output directory (required)."
   echo "  -c <chains_to_design>     : Chains to design (e.g., \"A B\"). If not specified, attempts to design all chains."
   echo "  -n <num_seq_per_target>   : Number of sequences to generate per target (default: ${NUM_SEQ_PER_TARGET})."
+  echo "  -b <batch_size>           : ProteinMPNN batch size (default: ${BATCH_SIZE})."
   echo "  -t <sampling_temp>        : Sampling temperature (default: ${SAMPLING_TEMP})."
   echo "  -h                        : Display this help message."
   exit 1
 }
 
 # Parse command-line arguments
-while getopts ":p:o:c:n:t:h" opt; do
+while getopts ":p:o:c:n:t:b:h" opt; do
   case ${opt} in
     p )
       PDB_FILE=$OPTARG
@@ -38,6 +41,9 @@ while getopts ":p:o:c:n:t:h" opt; do
       ;;
     n )
       NUM_SEQ_PER_TARGET=$OPTARG
+      ;;
+    b )
+      BATCH_SIZE=$OPTARG
       ;;
     t )
       SAMPLING_TEMP=$OPTARG
@@ -76,7 +82,7 @@ CMD_ARGS=(
     "--num_seq_per_target" "${NUM_SEQ_PER_TARGET}"
     "--sampling_temp" "${SAMPLING_TEMP}"
     "--seed" "37"  # Or make this an argument
-    "--batch_size" "1" # Or make this an argument
+    "--batch_size" "${BATCH_SIZE}"
 )
 
 if [ -n "${CHAINS_TO_DESIGN}" ]; then

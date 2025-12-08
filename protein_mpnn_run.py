@@ -56,9 +56,43 @@ def main(args):
 
     checkpoint_path = model_folder_path + f'{args.model_name}.pt'
     folder_for_outputs = args.out_folder
-    
-    NUM_BATCHES = args.num_seq_per_target//args.batch_size
-    BATCH_COPIES = args.batch_size
+
+    def _split_paths(value):
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [str(v) for v in value if str(v).strip()]
+        tokens = [tok.strip() for tok in str(value).replace(" ", ",").split(",") if tok.strip()]
+        return tokens
+
+    # Allow comma/space-separated multiple PDBs; if multiple are provided, treat each as a distinct input.
+    pdb_paths = _split_paths(args.pdb_path)
+    batch_size_cli = max(1, args.batch_size)
+    has_multiple_pdbs = len(pdb_paths) > 1
+
+    if has_multiple_pdbs:
+        # Do not replicate each protein; iterate over distinct inputs sequentially.
+        batch_size = 1
+        batch_schedule = [1]
+        NUM_BATCHES = 1
+        BATCH_COPIES = 1
+        batch_start_indices = [0]
+    else:
+        batch_size = batch_size_cli
+        total_sequences = max(1, args.num_seq_per_target) * batch_size
+        batch_schedule = []
+        if total_sequences > 0:
+            remaining = total_sequences
+            while remaining > 0:
+                batch_schedule.append(min(batch_size, remaining))
+                remaining -= batch_size
+        NUM_BATCHES = len(batch_schedule)
+        BATCH_COPIES = max(batch_schedule) if batch_schedule else batch_size
+        batch_start_indices = []
+        offset = 0
+        for size in batch_schedule:
+            batch_start_indices.append(offset)
+            offset += size
     temperatures = [float(item) for item in args.sampling_temp.split()]
     omit_AAs_list = args.omit_AAs
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
@@ -161,17 +195,35 @@ def main(args):
                     if AA in list(bias_AA_dict.keys()):
                             bias_AAs_np[n] = bias_AA_dict[AA]
     
-    if args.pdb_path:
-        pdb_dict_list = parse_PDB(args.pdb_path, ca_only=args.ca_only)
+    if pdb_paths:
+        pdb_dict_list = []
+        chain_id_dict = chain_id_dict or {}
+        seen_names = {}
+        for idx, pdb_path in enumerate(pdb_paths):
+            parsed_dicts = parse_PDB(pdb_path, ca_only=args.ca_only)
+            if not parsed_dicts:
+                continue
+            for pdb_dict in parsed_dicts:
+                base_name = pdb_dict.get("name") or f"pdb_{idx+1}"
+                count = seen_names.get(base_name, 0)
+                seen_names[base_name] = count + 1
+                if count > 0:
+                    pdb_dict["name"] = f"{base_name}_{count+1}"
+                else:
+                    pdb_dict["name"] = base_name
+                pdb_dict_list.append(pdb_dict)
+                all_chain_list = [item[-1:] for item in list(pdb_dict) if item[:9]=='seq_chain'] #['A','B', 'C',...]
+                if args.pdb_path_chains:
+                    designed_chain_list = [str(item) for item in args.pdb_path_chains.split()]
+                else:
+                    designed_chain_list = all_chain_list
+                fixed_chain_list = [letter for letter in all_chain_list if letter not in designed_chain_list]
+                chain_id_dict[pdb_dict["name"]] = (designed_chain_list, fixed_chain_list)
+
+        if not pdb_dict_list:
+            raise ValueError("No valid PDB entries parsed from pdb_path.")
+
         dataset_valid = StructureDatasetPDB(pdb_dict_list, truncate=None, max_length=args.max_length)
-        all_chain_list = [item[-1:] for item in list(pdb_dict_list[0]) if item[:9]=='seq_chain'] #['A','B', 'C',...]
-        if args.pdb_path_chains:
-            designed_chain_list = [str(item) for item in args.pdb_path_chains.split()]
-        else:
-            designed_chain_list = all_chain_list
-        fixed_chain_list = [letter for letter in all_chain_list if letter not in designed_chain_list]
-        chain_id_dict = {}
-        chain_id_dict[pdb_dict_list[0]['name']]= (designed_chain_list, fixed_chain_list)
     else:
         dataset_valid = StructureDataset(args.jsonl_path, truncate=None, max_length=args.max_length, verbose=print_all)
 
@@ -232,6 +284,7 @@ def main(args):
             all_probs_list = []
             all_log_probs_list = []
             S_sample_list = []
+            mask_for_loss_list = []
             batch_clones = [copy.deepcopy(protein) for i in range(BATCH_COPIES)]
             X, S, mask, lengths, chain_M, chain_encoding_all, chain_list_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, dihedral_mask, tied_pos_list_of_lists_list, pssm_coef, pssm_bias, pssm_log_odds_all, bias_by_res_all, tied_beta = tied_featurize(batch_clones, device, chain_id_dict, fixed_positions_dict, omit_AA_dict, tied_positions_dict, pssm_dict, bias_by_res_dict, ca_only=args.ca_only)
             pssm_log_odds_mask = (pssm_log_odds_all > args.pssm_threshold).float() #1.0 for true, 0.0 for false
@@ -252,15 +305,15 @@ def main(args):
                         input_seq_length = len(fasta_seqs[fc-1])
                         S_input = torch.tensor([alphabet_dict[AA] for AA in fasta_seqs[fc-1]], device=device)[None,:].repeat(X.shape[0], 1)
                         S[:,:input_seq_length] = S_input #assumes that S and S_input are alphabetically sorted for masked_chains
-                    for j in range(NUM_BATCHES):
+                    for j, current_batch_size in enumerate(batch_schedule):
                         randn_1 = torch.randn(chain_M.shape, device=X.device)
                         log_probs = model(X, S, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_1)
                         mask_for_loss = mask*chain_M*chain_M_pos
                         scores = _scores(S, log_probs, mask_for_loss)
-                        native_score = scores.cpu().data.numpy()
+                        native_score = scores.cpu().data.numpy()[:current_batch_size]
                         native_score_list.append(native_score)
                         global_scores = _scores(S, log_probs, mask)
-                        global_native_score = global_scores.cpu().data.numpy()
+                        global_native_score = global_scores.cpu().data.numpy()[:current_batch_size]
                         global_native_score_list.append(global_native_score)
                     native_score = np.concatenate(native_score_list, 0)
                     global_native_score = np.concatenate(global_native_score_list, 0)
@@ -287,10 +340,10 @@ def main(args):
                     print(f'Calculating conditional probabilities for {name_}')
                 conditional_probs_only_file = base_folder + '/conditional_probs_only/' + batch_clones[0]['name']
                 log_conditional_probs_list = []
-                for j in range(NUM_BATCHES):
+                for j, current_batch_size in enumerate(batch_schedule):
                     randn_1 = torch.randn(chain_M.shape, device=X.device)
                     log_conditional_probs = model.conditional_probs(X, S, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_1, args.conditional_probs_only_backbone)
-                    log_conditional_probs_list.append(log_conditional_probs.cpu().numpy())
+                    log_conditional_probs_list.append(log_conditional_probs.cpu().numpy()[:current_batch_size])
                 concat_log_p = np.concatenate(log_conditional_probs_list, 0) #[B, L, 21]
                 mask_out = (chain_M*chain_M_pos*mask)[0,].cpu().numpy()
                 np.savez(conditional_probs_only_file, log_p=concat_log_p, S=S[0,].cpu().numpy(), mask=mask[0,].cpu().numpy(), design_mask=mask_out)
@@ -299,9 +352,9 @@ def main(args):
                     print(f'Calculating sequence unconditional probabilities for {name_}')
                 unconditional_probs_only_file = base_folder + '/unconditional_probs_only/' + batch_clones[0]['name']
                 log_unconditional_probs_list = []
-                for j in range(NUM_BATCHES):
+                for j, current_batch_size in enumerate(batch_schedule):
                     log_unconditional_probs = model.unconditional_probs(X, mask, residue_idx, chain_encoding_all)
-                    log_unconditional_probs_list.append(log_unconditional_probs.cpu().numpy())
+                    log_unconditional_probs_list.append(log_unconditional_probs.cpu().numpy()[:current_batch_size])
                 concat_log_p = np.concatenate(log_unconditional_probs_list, 0) #[B, L, 21]
                 mask_out = (chain_M*chain_M_pos*mask)[0,].cpu().numpy()
                 np.savez(unconditional_probs_only_file, log_p=concat_log_p, S=S[0,].cpu().numpy(), mask=mask[0,].cpu().numpy(), design_mask=mask_out)
@@ -313,6 +366,9 @@ def main(args):
                 native_score = scores.cpu().data.numpy()
                 global_scores = _scores(S, log_probs, mask) #score the whole structure-sequence
                 global_native_score = global_scores.cpu().data.numpy()
+                first_batch_size = batch_schedule[0] if batch_schedule else 0
+                native_score_batch = native_score[:first_batch_size] if first_batch_size else native_score
+                global_native_score_batch = global_native_score[:first_batch_size] if first_batch_size else global_native_score
                 # Generate some sequences
                 ali_file = base_folder + '/seqs/' + batch_clones[0]['name'] + '.fa'
                 score_file = base_folder + '/scores/' + batch_clones[0]['name'] + '.npz'
@@ -322,7 +378,7 @@ def main(args):
                 t0 = time.time()
                 with open(ali_file, 'w') as f:
                     for temp in temperatures:
-                        for j in range(NUM_BATCHES):
+                        for j, current_batch_size in enumerate(batch_schedule):
                             randn_2 = torch.randn(chain_M.shape, device=X.device)
                             if tied_positions_dict == None:
                                 sample_dict = model.sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), bias_by_res=bias_by_res_all)
@@ -331,27 +387,32 @@ def main(args):
                                 sample_dict = model.tied_sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), tied_pos=tied_pos_list_of_lists_list[0], tied_beta=tied_beta, bias_by_res=bias_by_res_all)
                             # Compute scores
                                 S_sample = sample_dict["S"]
+                            S_sample_batch = S_sample[:current_batch_size]
                             log_probs = model(X, S_sample, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_2, use_input_decoding_order=True, decoding_order=sample_dict["decoding_order"])
                             mask_for_loss = mask*chain_M*chain_M_pos
                             scores = _scores(S_sample, log_probs, mask_for_loss)
-                            scores = scores.cpu().data.numpy()
-                            
+                            scores_batch = scores.cpu().data.numpy()[:current_batch_size]
+
                             global_scores = _scores(S_sample, log_probs, mask) #score the whole structure-sequence
-                            global_scores = global_scores.cpu().data.numpy()
-                            
-                            all_probs_list.append(sample_dict["probs"].cpu().data.numpy())
-                            all_log_probs_list.append(log_probs.cpu().data.numpy())
-                            S_sample_list.append(S_sample.cpu().data.numpy())
-                            for b_ix in range(BATCH_COPIES):
+                            global_scores_batch = global_scores.cpu().data.numpy()[:current_batch_size]
+
+                            all_probs_list.append(sample_dict["probs"][:current_batch_size].cpu().data.numpy())
+                            all_log_probs_list.append(log_probs[:current_batch_size].cpu().data.numpy())
+                            S_sample_list.append(S_sample_batch.cpu().data.numpy())
+                            mask_for_loss_batch = mask_for_loss[:current_batch_size]
+                            S_batch = S[:current_batch_size]
+                            chain_M_batch = chain_M[:current_batch_size]
+                            mask_for_loss_list.append(mask_for_loss_batch.cpu().data.numpy())
+                            for b_ix in range(current_batch_size):
                                 masked_chain_length_list = masked_chain_length_list_list[b_ix]
                                 masked_list = masked_list_list[b_ix]
-                                seq_recovery_rate = torch.sum(torch.sum(torch.nn.functional.one_hot(S[b_ix], 21)*torch.nn.functional.one_hot(S_sample[b_ix], 21),axis=-1)*mask_for_loss[b_ix])/torch.sum(mask_for_loss[b_ix])
-                                seq = _S_to_seq(S_sample[b_ix], chain_M[b_ix])
-                                score = scores[b_ix]
+                                seq_recovery_rate = torch.sum(torch.sum(torch.nn.functional.one_hot(S_batch[b_ix], 21)*torch.nn.functional.one_hot(S_sample_batch[b_ix], 21),axis=-1)*mask_for_loss_batch[b_ix])/torch.sum(mask_for_loss_batch[b_ix])
+                                seq = _S_to_seq(S_sample_batch[b_ix], chain_M_batch[b_ix])
+                                score = scores_batch[b_ix]
                                 score_list.append(score)
-                                global_score = global_scores[b_ix]
+                                global_score = global_scores_batch[b_ix]
                                 global_score_list.append(global_score)
-                                native_seq = _S_to_seq(S[b_ix], chain_M[b_ix])
+                                native_seq = _S_to_seq(S_batch[b_ix], chain_M_batch[b_ix])
                                 if b_ix == 0 and j==0 and temp==temperatures[0]:
                                     start = 0
                                     end = 0
@@ -370,8 +431,8 @@ def main(args):
                                     print_masked_chains = [masked_list_list[0][i] for i in sorted_masked_chain_letters]
                                     sorted_visible_chain_letters = np.argsort(visible_list_list[0])
                                     print_visible_chains = [visible_list_list[0][i] for i in sorted_visible_chain_letters]
-                                    native_score_print = np.format_float_positional(np.float32(native_score.mean()), unique=False, precision=4)
-                                    global_native_score_print = np.format_float_positional(np.float32(global_native_score.mean()), unique=False, precision=4)
+                                    native_score_print = np.format_float_positional(np.float32(native_score_batch.mean()), unique=False, precision=4)
+                                    global_native_score_print = np.format_float_positional(np.float32(global_native_score_batch.mean()), unique=False, precision=4)
                                     script_dir = os.path.dirname(os.path.realpath(__file__))
                                     try:
                                         commit_str = subprocess.check_output(f'git --git-dir {script_dir}/.git rev-parse HEAD', shell=True, stderr=subprocess.DEVNULL).decode().strip()
@@ -399,7 +460,7 @@ def main(args):
                                 score_print = np.format_float_positional(np.float32(score), unique=False, precision=4)
                                 global_score_print = np.format_float_positional(np.float32(global_score), unique=False, precision=4)
                                 seq_rec_print = np.format_float_positional(np.float32(seq_recovery_rate.detach().cpu().numpy()), unique=False, precision=4)
-                                sample_number = j*BATCH_COPIES+b_ix+1
+                                sample_number = batch_start_indices[j]+b_ix+1
                                 f.write('>T={}, sample={}, score={}, global_score={}, seq_recovery={}\n{}\n'.format(temp,sample_number,score_print,global_score_print,seq_rec_print,seq)) #write generated sequence
 
                 print(f"Saved sequences to {ali_file}")
@@ -410,10 +471,11 @@ def main(args):
                     all_probs_concat = np.concatenate(all_probs_list)
                     all_log_probs_concat = np.concatenate(all_log_probs_list)
                     S_sample_concat = np.concatenate(S_sample_list)
-                    np.savez(probs_file, probs=np.array(all_probs_concat, np.float32), log_probs=np.array(all_log_probs_concat, np.float32), S=np.array(S_sample_concat, np.int32), mask=mask_for_loss.cpu().data.numpy(), chain_order=chain_list_list)
+                    mask_concat = np.concatenate(mask_for_loss_list) if mask_for_loss_list else mask_for_loss.cpu().data.numpy()
+                    np.savez(probs_file, probs=np.array(all_probs_concat, np.float32), log_probs=np.array(all_log_probs_concat, np.float32), S=np.array(S_sample_concat, np.int32), mask=mask_concat, chain_order=chain_list_list)
                 t1 = time.time()
                 dt = round(float(t1-t0), 4)
-                num_seqs = len(temperatures)*NUM_BATCHES*BATCH_COPIES
+                num_seqs = len(temperatures)*sum(batch_schedule)
                 total_length = X.shape[1]
                 if print_all:
                     print(f'{num_seqs} sequences of length {total_length} generated in {dt} seconds')
